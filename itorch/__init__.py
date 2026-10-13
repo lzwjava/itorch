@@ -14,7 +14,7 @@ from .tensor import Tensor, dtype
 from .tensor import (tensor, as_tensor, from_numpy, zeros, ones, full, arange, randn, rand,
                      randn_like, rand_like, zeros_like, ones_like)
 from . import functions, nn, optim, schedulers
-from .functions import (no_grad, manual_seed, grad,
+from .functions import (no_grad, manual_seed, grad, gradcheck, profile,
                         cat, stack, where,
                         exp, log, sqrt, relu, gelu, silu, softplus, sin, cos,
                         sigmoid, tanh, softmax, log_softmax,
@@ -24,13 +24,13 @@ from .functions import (no_grad, manual_seed, grad,
                         TensorDataset, DataLoader,
                         save, load)
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Tensor", "tensor", "as_tensor", "from_numpy", "zeros", "ones", "full", "arange", "randn", "rand",
     "randn_like", "rand_like", "zeros_like", "ones_like",
     "nn", "optim", "functions", "schedulers",
-    "no_grad", "manual_seed", "grad",
+    "no_grad", "manual_seed", "grad", "gradcheck", "profile",
     "cat", "stack", "where",
     "exp", "log", "sqrt", "relu", "gelu", "silu", "softplus", "sin", "cos",
     "sigmoid", "tanh", "softmax", "log_softmax",

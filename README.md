@@ -23,10 +23,12 @@ for x, y in dataloader:          # x: Tensor(64, 784)
 ### autograd
 | piece | details |
 |------|------|
-| `Tensor` | reverse-mode autograd over a numpy array: `+ - * / ** @`, matmul (batched & 1-D), `sum/mean/var/std/max/min`, `exp/log/sqrt/abs`, `relu/leaky_relu/gelu/silu/softplus/sigmoid/tanh/softmax/log_softmax`, `sin/cos`, `reshape/transpose/permute/unsqueeze/squeeze/flatten`, slicing `x[i]`, `gather`, `cat/stack/where`, `im2col`/`col2im` (conv engines), `zeros_like/ones_like/randn_like/rand_like` |
+| `Tensor` | reverse-mode autograd over a numpy array: `+ - * / ** @`, matmul (batched & 1-D), `sum/mean/var/std/max/min`, `exp/log/sqrt/abs`, `relu/leaky_relu/gelu/silu/softplus/sigmoid/tanh/softmax/log_softmax`, `sin/cos`, `reshape/transpose/permute/unsqueeze/squeeze/flatten`, slicing `x[i]` (basic-slice backward does a fast zero-pad), `gather`, `cat/stack/where`, `im2col`/`col2im` (conv engines), `zeros_like/ones_like/randn_like/rand_like` |
 | `backward()` | topological pass; frees the graph afterwards. `retain_graph=True` keeps it for a second call; a repeat `backward()` on a freed graph raises `RuntimeError`. `tt.grad(outputs, inputs)` exposes grads directly. |
 | `grad_fn` | `y.grad_fn` → `"matmul((3,4),(4,5)) -> (3,5)"` for debugging |
 | `no_grad` | works as `with no_grad():` **and** as a decorator `@no_grad` |
+| `tt.gradcheck` | validate custom layers against finite differences: `tt.gradcheck(fn, x, y)` |
+| `tt.profile` | per-op backward timings: `with tt.profile() as p: loss.backward(); p.report()` |
 
 ### nn
 `Module` (params, `train/eval`, `freeze/unfreeze`, `state_dict`), `Sequential`,
@@ -51,12 +53,14 @@ Class-based losses (`nn.MSELoss`, `nn.L1Loss`, `nn.HuberLoss`, `nn.BCELoss`,
 python3 tests/test_autograd.py       # numeric-gradient check of every core op
 python3 tests/test_sophisticated.py  # gradchecks: gelu, norms, pools, rnns, attention, transformer, losses
 python3 tests/test_round3.py         # gradchecks: convT/col2im, new activations, optimizers, losses, VAE
+python3 tests/test_round4.py         # gradcheck/profile utils, conv identities, slicing, DCGAN smoke
 python3 tests/test_train.py          # end-to-end training smoke tests
 python3 examples/01_xor.py
 python3 examples/02_linear_regression.py
 python3 examples/03_mnist_cnn.py --epochs 3    # downloads MNIST (~11 MB), ~2 min
 python3 examples/04_tiny_gpt.py --steps 400    # char-level transformer, samples Shakespeare-ish text
 python3 examples/05_vae_mnist.py --epochs 2    # convolutional VAE, ~1.5 min, writes grid_vae.png
+python3 examples/06_dcgan_mnist.py             # DCGAN: adversarial min-max, ~2 min, writes grid_dcgan.png
 ```
 
 ## how the autograd works
@@ -75,10 +79,11 @@ runs `∂z/∂add → ∂add/∂mul → ∂mul/∂x = 2`, leaving `x.grad == [2,
 
 * **Float32, CPU only**, `Tensor(x).item()/numpy()` for inspection.
 * **im2col conv**: unfold with `sliding_window_view` + one matmul; gradients
-  scatter back with overlap-add.
+  scatter back with **per-tap strided adds (17× faster than the original
+  `np.add.at` version)**.
 * **Verified end-to-end**: MNIST CNN **98.3% test accuracy in 3 epochs**; a
   ~40k-parameter char-level GPT drops cross-entropy from 2.4 to 0.13 and emits
-  coherent Shakespeare-style fragments; a convolutional **VAE** (built on the
-  `col2im` op + reparameterization + free-bits KL) reconstructs digits and
-  generates a 10×10 grid of new ones.
-* **Small**: ~2,300 lines of Python, no compilation.
+  coherent Shakespeare-style fragments; a convolutional **VAE** (free-bits KL)
+  reconstructs digits; a **DCGAN** trains with healthy adversarial dynamics and
+  generates digits (**256/256 healthy samples** after 1000 steps).
+* **Small**: ~3,600 lines of Python, no compilation.

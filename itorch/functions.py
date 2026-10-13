@@ -51,6 +51,58 @@ def manual_seed(seed):
     np.random.seed(seed)
 
 
+def profile():
+    """Context manager that times every op used inside backward().
+
+        with tt.profile() as p:
+            loss.backward()
+        p.report()
+    """
+    return _t._Profiler()
+
+
+def gradcheck(fn, *tensors, eps=1e-4, atol=1e-2, rtol=1e-2, raise_on_error=True, verbose=False):
+    """Verify autograd gradients of a scalar function against finite differences.
+
+        tt.gradcheck(lambda x: (x * 2).sum(), Tensor.randn(3, 4, requires_grad=True))
+
+    `fn(*tensors)` must return a scalar (or tensor reduced inside fn). Returns
+    (passed: bool, max_err: float) and raises ValueError on failure by default.
+    """
+    tensors = [t if isinstance(t, Tensor) else Tensor(t, requires_grad=True) for t in tensors]
+    for t in tensors:
+        if not t.requires_grad:
+            t.requires_grad = True
+    out = fn(*tensors)
+    assert out.ndim == 0, "gradcheck: fn must return a scalar Tensor (try fn(...).sum())"
+    out.backward()
+    ok, max_err = True, 0.0
+    for t in tensors:
+        ana = np.asarray(t.grad, dtype=dtype)
+        num = np.zeros_like(t.data)
+        for i in np.ndindex(t.data.shape):
+            o = t.data[i]
+            t.data[i] = o + eps
+            fp = float(fn(*tensors).data)
+            t.data[i] = o - eps
+            fm = float(fn(*tensors).data)
+            t.data[i] = o
+            num[i] = (fp - fm) / (2 * eps)
+        err = float(np.max(np.abs(ana - num)))
+        if err > max_err:
+            max_err = err
+        tol = atol + rtol * float(np.max(np.abs(ana)))
+        if err > tol:
+            ok = False
+            if verbose:
+                print(f"  gradcheck FAIL {tuple(t.shape)}: max err {err:.2e} (tol {tol:.2e})")
+    if not ok and raise_on_error:
+        raise ValueError(f"gradcheck FAILED (max err {max_err:.2e})")
+    if ok and verbose:
+        print(f"  gradcheck ok   (max err {max_err:.2e})")
+    return ok, max_err
+
+
 # --------------------------------------------------------------------------
 # functional ops
 # --------------------------------------------------------------------------

@@ -8,6 +8,7 @@ given the gradient of the output, propagates gradients to the parents).
 from __future__ import annotations
 
 import sys
+import time
 import numpy as np
 
 if sys.getrecursionlimit() < 10000:
@@ -15,6 +16,7 @@ if sys.getrecursionlimit() < 10000:
 
 dtype = np.float32          # default dtype for all tensors
 _grad_enabled = True        # toggled by itorch.no_grad()
+_PROFILE = None             # active itorch.profile() context (op-level timing)
 
 
 # --------------------------------------------------------------------------
@@ -94,6 +96,16 @@ def _as_tensor(data, requires_grad=False):
     if isinstance(data, Tensor):
         return data
     return Tensor(data, requires_grad=requires_grad)
+
+
+def _is_basic_index(idx):
+    """True when idx is pure slice/int/None/Ellipsis indexing (no duplicates)."""
+    if not isinstance(idx, tuple):
+        idx = (idx,)
+    for i in idx:
+        if not isinstance(i, (slice, int, np.integer, type(None), type(Ellipsis))):
+            return False
+    return True
 
 
 def _requires(*ts):
@@ -200,7 +212,12 @@ class Tensor:
         self._accumulate(grad)
         for t in reversed(topo):
             if t.requires_grad:
-                t._backward(t.grad)
+                if _PROFILE is None:
+                    t._backward(t.grad)
+                else:
+                    t0 = time.perf_counter()
+                    t._backward(t.grad)
+                    _PROFILE.add(t._op or "?", time.perf_counter() - t0)
         if not retain_graph:
             # free the graph (keep user-created leaf nodes usable for new graphs)
             for t in topo:
@@ -620,8 +637,10 @@ class Tensor:
                 zero = np.zeros_like(self.data)
                 if np.asarray(idx).dtype == bool and np.asarray(idx).shape == self.data.shape:
                     zero[idx] += g          # boolean mask: unique positions, safe
+                elif _is_basic_index(idx):
+                    zero[idx] = g           # pure slices/ints: unique positions, fast pad
                 else:
-                    np.add.at(zero, idx, g)  # handles duplicates
+                    np.add.at(zero, idx, g)  # handles duplicate (advanced) indices
                 self._accumulate(zero)
             out._set((self,), backward)
         return out
@@ -671,18 +690,13 @@ class Tensor:
                 g = np.asarray(g, dtype=dtype)
                 gr = g.reshape(N, C, kh, kw, oh, ow).transpose(0, 1, 4, 5, 2, 3)  # (N,C,OH,OW,kh,kw)
                 gp = np.zeros((N, C, H + 2 * p[0], W + 2 * p[1]), dtype=dtype)
-                an = np.arange(N)[:, None, None, None, None, None]
-                ac = np.arange(C)[None, :, None, None, None, None]
-                aa = np.arange(oh)[None, None, :, None, None, None]
-                ab = np.arange(ow)[None, None, None, :, None, None]
-                ai = np.arange(kh)[None, None, None, None, :, None]
-                aj = np.arange(kw)[None, None, None, None, None, :]
-                np.add.at(gp, (np.broadcast_to(an, gr.shape),
-                               np.broadcast_to(ac, gr.shape),
-                               np.broadcast_to(aa * s[0] + ai, gr.shape),
-                               np.broadcast_to(ab * s[1] + aj, gr.shape)), gr)
-                crop = gp[:, :, p[0]:p[0] + H, p[1]:p[1] + W]
-                self._accumulate(crop)
+                # per-tap scatter: each tap writes a strided slice of gp (oh/ow anchors)
+                for i in range(kh):
+                    hs = slice(i, i + s[0] * (oh - 1) + 1, s[0])
+                    for j in range(kw):
+                        ws = slice(j, j + s[1] * (ow - 1) + 1, s[1])
+                        gp[:, :, hs, ws] += gr[:, :, :, :, i, j]
+                self._accumulate(gp[:, :, p[0]:p[0] + H, p[1]:p[1] + W])
             out._set((self,), backward)
         return out
 
@@ -704,16 +718,11 @@ class Tensor:
         assert oh * ow == AB, f"col2im: expected {oh * ow} columns, got {AB}"
         canvas = np.zeros((N, C, H + 2 * p[0], W + 2 * p[1]), dtype=dtype)
         gr = self.data.reshape(N, C, kh, kw, oh, ow).transpose(0, 1, 4, 5, 2, 3)  # (N,C,OH,OW,kh,kw)
-        an = np.arange(N)[:, None, None, None, None, None]
-        ac = np.arange(C)[None, :, None, None, None, None]
-        aa = np.arange(oh)[None, None, :, None, None, None]
-        ab = np.arange(ow)[None, None, None, :, None, None]
-        ai = np.arange(kh)[None, None, None, None, :, None]
-        aj = np.arange(kw)[None, None, None, None, None, :]
-        np.add.at(canvas, (np.broadcast_to(an, gr.shape),
-                           np.broadcast_to(ac, gr.shape),
-                           np.broadcast_to(aa * s[0] + ai, gr.shape),
-                           np.broadcast_to(ab * s[1] + aj, gr.shape)), gr)
+        for i in range(kh):
+            hs = slice(i, i + s[0] * (oh - 1) + 1, s[0])
+            for j in range(kw):
+                ws = slice(j, j + s[1] * (ow - 1) + 1, s[1])
+                canvas[:, :, hs, ws] += gr[:, :, :, :, i, j]
         out = Tensor(np.array(canvas[:, :, p[0]:p[0] + H, p[1]:p[1] + W], copy=True),
                      requires_grad=self.requires_grad and _grad_enabled)
         out._oh, out._ow = oh, ow
@@ -773,3 +782,45 @@ def zeros_like(t, requires_grad=False):
 
 def ones_like(t, requires_grad=False):
     return Tensor(np.ones(t.shape, dtype=dtype), requires_grad)
+
+# --------------------------------------------------------------------------
+# op-level profiler
+# --------------------------------------------------------------------------
+
+class _Profiler:
+    """Context manager that times every backward-op invocation.
+
+    Usage:
+        with _Profiler() as prof:
+            loss.backward()
+        prof.report()
+    """
+
+    def __init__(self):
+        self.op = {}          # op name -> [total_seconds, call_count]
+
+    def __enter__(self):
+        global _PROFILE
+        self._prev = _PROFILE
+        _PROFILE = self
+        return self
+
+    def __exit__(self, *_exc):
+        global _PROFILE
+        _PROFILE = self._prev
+        return False
+
+    def add(self, op, dt):
+        st = self.op.setdefault(op, [0.0, 0])
+        st[0] += dt
+        st[1] += 1
+
+    def report(self, top=12):
+        rows = sorted(((t, c, op) for op, (t, c) in self.op.items()), reverse=True)
+        total = sum(t for t, _, _ in rows)
+        print(f"[profile] {total * 1000:.1f} ms across {len(rows)} backward-op types "
+              f"({sum(c for _, c, _ in rows)} calls)")
+        print(f"{'op':<20}{'calls':>8}{'ms':>10}{'%':>8}")
+        for t, c, op in rows[:top]:
+            print(f"{op:<20}{c:>8}{t * 1000:>10.2f}{100 * t / total:>7.1f}%")
+        return self.op
