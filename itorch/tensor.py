@@ -78,6 +78,18 @@ def _gelu_grad(x):
     return 0.5 * (1.0 + _erf(z)) + x * np.exp(-z * z) / np.sqrt(2.0 * np.pi)
 
 
+def _im2col_np(x, kh, kw, sh, sw, ph, pw):
+    """(N, C, H, W) -> cols (N, C*kh*kw, OH*OW) + (OH, OW)."""
+    N, C, H, W = x.shape
+    xp = np.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw)))
+    Hp, Wp = xp.shape[-2], xp.shape[-1]
+    oh = (Hp - kh) // sh + 1
+    ow = (Wp - kw) // sw + 1
+    win = np.lib.stride_tricks.sliding_window_view(xp, (kh, kw), axis=(-2, -1))
+    win = win[:, :, ::sh, ::sw].transpose(0, 1, 4, 5, 2, 3)
+    return np.ascontiguousarray(win.reshape(N, C * kh * kw, oh * ow)), oh, ow
+
+
 def _as_tensor(data, requires_grad=False):
     if isinstance(data, Tensor):
         return data
@@ -301,6 +313,13 @@ class Tensor:
             out._set((self, o), backward)
         return out
 
+    # torch-style method aliases (must come after the dunders they alias)
+    add = __add__
+    sub = __sub__
+    mul = __mul__
+    div = __truediv__
+    neg = __neg__
+
     # -- reductions -----------------------------------------------------------
     def sum(self, axis=None, keepdims=False):
         axes = _norm_axes(self.data.ndim, axis)
@@ -430,8 +449,52 @@ class Tensor:
             out._set((self,), backward)
         return out
 
+    def silu(self):
+        """SiLU / Swish: x * sigmoid(x)."""
+        s = 1.0 / (1.0 + np.exp(-self.data))
+        out = Tensor(self.data * s, requires_grad=self.requires_grad and _grad_enabled)
+        if out.requires_grad:
+            def backward(g):
+                g = np.asarray(g, dtype=dtype)
+                self._accumulate(g * (s * (1.0 + self.data * (1.0 - s))))
+            out._set((self,), backward)
+        return out
+
+    def softplus(self, beta=1.0):
+        """log(1 + exp(beta*x)) / beta, computed stably."""
+        b = self.data * beta
+        stable = np.maximum(b, 0) + np.log1p(np.exp(-np.abs(b)))
+        out = Tensor(stable / beta, requires_grad=self.requires_grad and _grad_enabled)
+        if out.requires_grad:
+            def backward(g):
+                g = np.asarray(g, dtype=dtype)
+                self._accumulate(g * (1.0 / (1.0 + np.exp(-b))))
+            out._set((self,), backward)
+        return out
+
+    def sin(self):
+        out = Tensor(np.sin(self.data), requires_grad=self.requires_grad and _grad_enabled)
+        if out.requires_grad:
+            def backward(g):
+                g = np.asarray(g, dtype=dtype)
+                self._accumulate(g * np.cos(self.data))
+            out._set((self,), backward)
+        return out
+
+    def cos(self):
+        out = Tensor(np.cos(self.data), requires_grad=self.requires_grad and _grad_enabled)
+        if out.requires_grad:
+            def backward(g):
+                g = np.asarray(g, dtype=dtype)
+                self._accumulate(g * (-np.sin(self.data)))
+            out._set((self,), backward)
+        return out
+
     def sigmoid(self):
-        out = Tensor(1.0 / (1.0 + np.exp(-self.data)), requires_grad=self.requires_grad and _grad_enabled)
+        x = self.data
+        # numerically stable: avoids overflow for large |x|
+        out = Tensor(np.where(x >= 0, 1.0 / (1.0 + np.exp(-x)), np.exp(x) / (1.0 + np.exp(x))),
+                     requires_grad=self.requires_grad and _grad_enabled)
         if out.requires_grad:
             def backward(g):
                 g = np.asarray(g, dtype=dtype)
@@ -598,21 +661,16 @@ class Tensor:
         p = _pair(padding)
         s = _pair(stride)
         kh, kw = k
-        N, C, H, W = self.data.shape
-        xp = np.pad(self.data, ((0, 0), (0, 0), (p[0], p[0]), (p[1], p[1])))
-        Hp, Wp = xp.shape[-2], xp.shape[-1]
-        oh = (Hp - kh) // s[0] + 1
-        ow = (Wp - kw) // s[1] + 1
-        win = np.lib.stride_tricks.sliding_window_view(xp, (kh, kw), axis=(-2, -1))
-        win = win[:, :, ::s[0], ::s[1]]                     # (N, C, OH, OW, kh, kw)
-        cols = win.transpose(0, 1, 4, 5, 2, 3).reshape(N, C * kh * kw, oh * ow)
-        out = Tensor(np.array(cols, copy=True), requires_grad=self.requires_grad and _grad_enabled)
+        cols, oh, ow = _im2col_np(self.data, kh, kw, s[0], s[1], p[0], p[1])
+        out = Tensor(cols, requires_grad=self.requires_grad and _grad_enabled)
         out._oh, out._ow = oh, ow
         if out.requires_grad:
+            N, C, H, W = self.data.shape
+
             def backward(g):
                 g = np.asarray(g, dtype=dtype)
                 gr = g.reshape(N, C, kh, kw, oh, ow).transpose(0, 1, 4, 5, 2, 3)  # (N,C,OH,OW,kh,kw)
-                gp = np.zeros((N, C, Hp, Wp), dtype=dtype)
+                gp = np.zeros((N, C, H + 2 * p[0], W + 2 * p[1]), dtype=dtype)
                 an = np.arange(N)[:, None, None, None, None, None]
                 ac = np.arange(C)[None, :, None, None, None, None]
                 aa = np.arange(oh)[None, None, :, None, None, None]
@@ -625,6 +683,45 @@ class Tensor:
                                np.broadcast_to(ab * s[1] + aj, gr.shape)), gr)
                 crop = gp[:, :, p[0]:p[0] + H, p[1]:p[1] + W]
                 self._accumulate(crop)
+            out._set((self,), backward)
+        return out
+
+    def col2im(self, out_shape, kernel_size, stride=1, padding=0):
+        """Fold columns (N, C*K*K, OH*OW) back into an image (N, C, H, W) with
+        overlap-add (w.r.t. the same kernel/stride/padding that produced them with
+        im2col). Backward is an im2col of the output gradient, so this is the
+        exact transpose of `im2col` — used by ConvTranspose2d.
+        """
+        k = _pair(kernel_size)
+        p = _pair(padding)
+        s = _pair(stride)
+        kh, kw = k
+        N, Ckk, AB = self.data.shape
+        C = Ckk // (kh * kw)
+        H, W = out_shape[2], out_shape[3]
+        oh = (H + 2 * p[0] - kh) // s[0] + 1
+        ow = (W + 2 * p[1] - kw) // s[1] + 1
+        assert oh * ow == AB, f"col2im: expected {oh * ow} columns, got {AB}"
+        canvas = np.zeros((N, C, H + 2 * p[0], W + 2 * p[1]), dtype=dtype)
+        gr = self.data.reshape(N, C, kh, kw, oh, ow).transpose(0, 1, 4, 5, 2, 3)  # (N,C,OH,OW,kh,kw)
+        an = np.arange(N)[:, None, None, None, None, None]
+        ac = np.arange(C)[None, :, None, None, None, None]
+        aa = np.arange(oh)[None, None, :, None, None, None]
+        ab = np.arange(ow)[None, None, None, :, None, None]
+        ai = np.arange(kh)[None, None, None, None, :, None]
+        aj = np.arange(kw)[None, None, None, None, None, :]
+        np.add.at(canvas, (np.broadcast_to(an, gr.shape),
+                           np.broadcast_to(ac, gr.shape),
+                           np.broadcast_to(aa * s[0] + ai, gr.shape),
+                           np.broadcast_to(ab * s[1] + aj, gr.shape)), gr)
+        out = Tensor(np.array(canvas[:, :, p[0]:p[0] + H, p[1]:p[1] + W], copy=True),
+                     requires_grad=self.requires_grad and _grad_enabled)
+        out._oh, out._ow = oh, ow
+        if out.requires_grad:
+            def backward(g):
+                g = np.asarray(g, dtype=dtype)
+                cols, _, _ = _im2col_np(g, kh, kw, s[0], s[1], p[0], p[1])
+                self._accumulate(cols)
             out._set((self,), backward)
         return out
 
@@ -664,3 +761,15 @@ def arange(start, stop=None, step=1, requires_grad=False):
     return Tensor(np.arange(start, stop, step, dtype=dtype), requires_grad)
 def randn(*shape, requires_grad=False): return Tensor(np.random.randn(*shape).astype(dtype), requires_grad)
 def rand(*shape, requires_grad=False): return Tensor(np.random.rand(*shape).astype(dtype), requires_grad)
+
+def randn_like(t, requires_grad=False):
+    return Tensor(np.random.randn(*t.shape).astype(dtype), requires_grad)
+
+def rand_like(t, requires_grad=False):
+    return Tensor(np.random.rand(*t.shape).astype(dtype), requires_grad)
+
+def zeros_like(t, requires_grad=False):
+    return Tensor(np.zeros(t.shape, dtype=dtype), requires_grad)
+
+def ones_like(t, requires_grad=False):
+    return Tensor(np.ones(t.shape, dtype=dtype), requires_grad)

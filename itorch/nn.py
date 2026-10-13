@@ -193,6 +193,47 @@ class Conv2d(Module):
         return y
 
 
+class ConvTranspose2d(Module):
+    """Transposed 2D convolution (a.k.a. fractionally-strided / deconvolution).
+
+    Implemented as the exact matrix-transpose of Conv2d using the `col2im`
+    op: unfold the input into columns, mul by the weight, then fold back
+    with overlap-add. Output size = (H-1)*stride - 2*padding + kernel.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        k = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
+        self.weight = Tensor(np.random.randn(in_channels, out_channels, k, k).astype(dtype)
+                             * np.sqrt(2.0 / (in_channels * k * k)),
+                             requires_grad=True)
+        self.bias = Tensor(np.zeros(out_channels, dtype=dtype), requires_grad=True) if bias else None
+
+    def forward(self, x):
+        N, Cin, H, W = x.shape
+        k = self.kernel_size if isinstance(self.kernel_size, int) else self.kernel_size[0]
+        s = self.stride if isinstance(self.stride, int) else self.stride[0]
+        p = self.padding if isinstance(self.padding, int) else self.padding[0]
+        kk = k * k
+        ## cols[n, co*kk+tap, hw] = sum_ci x[n,ci,hw] * w[ci, co, tap]
+        w = self.weight.reshape(Cin, self.out_channels * kk)          # (Cin, Cout*kk)
+        tmp = (x.reshape(N, Cin, H * W).permute(0, 2, 1) @ w)         # (N, HW, Cout*kk)
+        cols = tmp.reshape(N, H * W, self.out_channels, kk)\
+                  .permute(0, 2, 3, 1).reshape(N, self.out_channels * kk, H * W)
+        cv_h, cv_w = (H - 1) * s + k, (W - 1) * s + k                 # canvas spatial size
+        canvas = cols.col2im((N, self.out_channels, cv_h, cv_w), (k, k), stride=s, padding=0)
+        oh, ow = (H - 1) * s - 2 * p + k, (W - 1) * s - 2 * p + k
+        assert oh >= 1 and ow >= 1, "output too small for stride/padding/kernel"
+        out = canvas[:, :, p:p + oh, p:p + ow]
+        if self.bias is not None:
+            out = out + self.bias.reshape(1, self.out_channels, 1, 1)
+        return out
+
+
 class MaxPool2d(Module):
     def __init__(self, kernel_size, stride=None, padding=0):
         self.kernel_size = kernel_size
@@ -337,6 +378,15 @@ class ReLU(Module):
 
 class GELU(Module):
     def forward(self, x): return x.gelu()
+
+
+class SiLU(Module):
+    def forward(self, x): return x.silu()
+
+
+class Softplus(Module):
+    def __init__(self, beta=1.0): self.beta = beta
+    def forward(self, x): return x.softplus(self.beta)
 
 
 class LeakyReLU(Module):
@@ -519,3 +569,123 @@ class Transformer(Module):
         for b in self.blocks:
             x = b(x, mask)
         return self.ln(x)
+
+
+# --------------------------------------------------------------------------
+# class-based losses (thin wrappers over itorch.functions)
+# --------------------------------------------------------------------------
+
+from . import functions as _fn
+
+
+class _Loss(Module):
+    """Base class for loss modules. Losses are stateless, so train()/eval() no-op."""
+    training = False
+
+
+class MSELoss(_Loss):
+    def forward(self, input, target): return _fn.mse(input, target)
+
+
+class L1Loss(_Loss):
+    def forward(self, input, target): return _fn.l1(input, target)
+
+
+class HuberLoss(_Loss):
+    def __init__(self, delta=1.0):
+        super().__init__()
+        self.delta = delta
+
+    def forward(self, input, target): return _fn.huber(input, target, self.delta)
+
+
+class BCELoss(_Loss):
+    """Binary cross entropy on probabilities."""
+
+    def forward(self, prob, target):
+        prob, target = prob, target
+        return -(_fn._as_tensor(target) * prob.log() + (1 - target) * (1 - prob).log()).mean()
+
+
+class BCEWithLogitsLoss(_Loss):
+    def forward(self, logits, target): return _fn.bce(logits, target)
+
+
+class CrossEntropyLoss(_Loss):
+    def forward(self, logits, targets): return _fn.cross_entropy(logits, targets)
+
+
+class NLLLoss(_Loss):
+    def forward(self, log_probs, targets): return _fn.nll_loss(log_probs, targets)
+
+
+# --------------------------------------------------------------------------
+# weight initializers (mutate a parameter Tensor in place)
+# --------------------------------------------------------------------------
+
+class init:
+    """nn.init-style initializers, e.g. nn.init.kaiming_normal_(layer.weight).
+    These mutate the Tensor in place and return it (torch parity)."""
+
+    @staticmethod
+    def _fans(t):
+        """fan_in/fan_out. Convention: 1-D -> (size, size); 2-D -> (in, out)
+        (itorsh Linear storage); N-D conv tensors -> (out, in, kh, kw...)."""
+        if t.ndim == 1:
+            return t.size, t.size
+        if t.ndim == 2:
+            return t.shape[0], t.shape[1]
+        num_in = t.shape[1] * int(np.prod(t.shape[2:]))
+        num_out = t.shape[0] * int(np.prod(t.shape[2:]))
+        return num_in, num_out
+
+    @classmethod
+    def kaiming_normal_(cls, t, a=0.0, mode="fan_in"):
+        fan_in, fan_out = cls._fans(t)
+        fan = fan_in if mode == "fan_in" else fan_out
+        gain = np.sqrt(2.0 / (1 + a * a))
+        t.data = (np.random.randn(*t.shape) * gain / np.sqrt(fan)).astype(dtype)
+        return t
+
+    @classmethod
+    def kaiming_uniform_(cls, t, a=0.0, mode="fan_in"):
+        fan_in, fan_out = cls._fans(t)
+        fan = fan_in if mode == "fan_in" else fan_out
+        gain = np.sqrt(2.0 / (1 + a * a))
+        bound = gain * np.sqrt(3.0 / fan)
+        t.data = np.random.uniform(-bound, bound, size=t.shape).astype(dtype)
+        return t
+
+    @classmethod
+    def xavier_normal_(cls, t, gain=1.0):
+        fan_in, fan_out = cls._fans(t)
+        std = gain * np.sqrt(2.0 / (fan_in + fan_out))
+        t.data = (np.random.randn(*t.shape) * std).astype(dtype)
+        return t
+
+    @classmethod
+    def xavier_uniform_(cls, t, gain=1.0):
+        fan_in, fan_out = cls._fans(t)
+        bound = gain * np.sqrt(6.0 / (fan_in + fan_out))
+        t.data = np.random.uniform(-bound, bound, size=t.shape).astype(dtype)
+        return t
+
+    @staticmethod
+    def normal_(t, mean=0.0, std=1.0):
+        t.data = (np.random.randn(*t.shape) * std + mean).astype(dtype)
+        return t
+
+    @staticmethod
+    def uniform_(t, low=0.0, high=1.0):
+        t.data = np.random.uniform(low, high, size=t.shape).astype(dtype)
+        return t
+
+    @staticmethod
+    def zeros_(t):
+        t.data = np.zeros(t.shape, dtype=dtype)
+        return t
+
+    @staticmethod
+    def ones_(t):
+        t.data = np.ones(t.shape, dtype=dtype)
+        return t

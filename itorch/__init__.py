@@ -11,25 +11,29 @@ Requires only numpy. Fully usable for training small models on CPU:
     ...
 """
 from .tensor import Tensor, dtype
-from .tensor import (tensor, as_tensor, from_numpy, zeros, ones, full, arange, randn, rand)
+from .tensor import (tensor, as_tensor, from_numpy, zeros, ones, full, arange, randn, rand,
+                     randn_like, rand_like, zeros_like, ones_like)
 from . import functions, nn, optim, schedulers
-from .functions import (no_grad, manual_seed,
+from .functions import (no_grad, manual_seed, grad,
                         cat, stack, where,
-                        exp, log, sqrt, relu, gelu, sigmoid, tanh, softmax, log_softmax,
+                        exp, log, sqrt, relu, gelu, silu, softplus, sin, cos,
+                        sigmoid, tanh, softmax, log_softmax,
                         max, min, sum, mean,
                         mse, l1, huber, bce, cross_entropy, nll_loss, accuracy,
                         clip_grad_norm_, count_parameters,
                         TensorDataset, DataLoader,
                         save, load)
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Tensor", "tensor", "as_tensor", "from_numpy", "zeros", "ones", "full", "arange", "randn", "rand",
+    "randn_like", "rand_like", "zeros_like", "ones_like",
     "nn", "optim", "functions", "schedulers",
-    "no_grad", "manual_seed",
+    "no_grad", "manual_seed", "grad",
     "cat", "stack", "where",
-    "exp", "log", "sqrt", "relu", "gelu", "sigmoid", "tanh", "softmax", "log_softmax",
+    "exp", "log", "sqrt", "relu", "gelu", "silu", "softplus", "sin", "cos",
+    "sigmoid", "tanh", "softmax", "log_softmax",
     "max", "min", "sum", "mean",
     "mse", "l1", "huber", "bce", "cross_entropy", "nll_loss", "accuracy",
     "clip_grad_norm_", "count_parameters", "TensorDataset", "DataLoader", "save", "load",

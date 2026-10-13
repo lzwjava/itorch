@@ -101,6 +101,10 @@ def log(t):   return _as_tensor(t).log()
 def sqrt(t):  return _as_tensor(t).sqrt()
 def relu(t):  return _as_tensor(t).relu()
 def gelu(t):  return _as_tensor(t).gelu()
+def silu(t):  return _as_tensor(t).silu()
+def softplus(t, beta=1.0): return _as_tensor(t).softplus(beta)
+def sin(t):   return _as_tensor(t).sin()
+def cos(t):   return _as_tensor(t).cos()
 def sigmoid(t): return _as_tensor(t).sigmoid()
 def tanh(t):  return _as_tensor(t).tanh()
 def softmax(t, axis=-1):    return _as_tensor(t).softmax(axis=axis)
@@ -181,6 +185,25 @@ def clip_grad_norm_(params, max_norm):
             if p.grad is not None:
                 p.grad = p.grad * clip
     return total
+
+
+def grad(outputs, inputs, retain_graph=False):
+    """Compute gradients of a scalar (or list of) output(s) w.r.t. input tensors.
+
+    Returns a single gradient Tensor-value (numpy array) or a list for multiple
+    inputs. The computation graph is freed afterwards unless retain_graph=True.
+    """
+    out_list = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+    in_list = list(inputs) if isinstance(inputs, (list, tuple)) else [inputs]
+    grads = [None] * len(in_list)
+    for o in out_list:
+        o.backward(retain_graph=retain_graph or len(out_list) > 1)
+        for k, inp in enumerate(in_list):
+            if inp.grad is not None:
+                grads[k] = inp.grad if grads[k] is None else grads[k] + inp.grad
+    if isinstance(inputs, (list, tuple)):
+        return grads
+    return grads[0]
 
 
 # --------------------------------------------------------------------------

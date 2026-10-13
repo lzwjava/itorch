@@ -23,39 +23,40 @@ for x, y in dataloader:          # x: Tensor(64, 784)
 ### autograd
 | piece | details |
 |------|------|
-| `Tensor` | reverse-mode autograd over a numpy array: `+ - * / ** @`, matmul (batched & 1-D), `sum/mean/var/std/max/min`, `exp/log/sqrt/abs`, `relu/leaky_relu/gelu/sigmoid/tanh/softmax/log_softmax`, `reshape/transpose/permute/unsqueeze/squeeze/flatten`, slicing `x[i]`, `gather`, `cat/stack/where`, `im2col` (conv engine) |
-| `backward()` | topological pass; frees the graph afterwards. `retain_graph=True` keeps it for a second call; a repeat `backward()` on a freed graph raises `RuntimeError`. Leaf tensors stay reusable. |
+| `Tensor` | reverse-mode autograd over a numpy array: `+ - * / ** @`, matmul (batched & 1-D), `sum/mean/var/std/max/min`, `exp/log/sqrt/abs`, `relu/leaky_relu/gelu/silu/softplus/sigmoid/tanh/softmax/log_softmax`, `sin/cos`, `reshape/transpose/permute/unsqueeze/squeeze/flatten`, slicing `x[i]`, `gather`, `cat/stack/where`, `im2col`/`col2im` (conv engines), `zeros_like/ones_like/randn_like/rand_like` |
+| `backward()` | topological pass; frees the graph afterwards. `retain_graph=True` keeps it for a second call; a repeat `backward()` on a freed graph raises `RuntimeError`. `tt.grad(outputs, inputs)` exposes grads directly. |
 | `grad_fn` | `y.grad_fn` → `"matmul((3,4),(4,5)) -> (3,5)"` for debugging |
 | `no_grad` | works as `with no_grad():` **and** as a decorator `@no_grad` |
 
 ### nn
 `Module` (params, `train/eval`, `freeze/unfreeze`, `state_dict`), `Sequential`,
-`Linear`, `Embedding`, `Conv2d` (im2col), `MaxPool2d`, `AvgPool2d`,
-`BatchNorm1d/2d`, `LayerNorm`, `GroupNorm`, `Dropout`, `Flatten`,
-`ReLU/GELU/Sigmoid/Tanh/Softmax/LogSoftmax/LeakyReLU`, **recurrent**:
+`Linear`, `Embedding`, `Conv2d`, `ConvTranspose2d` (im2col/col2im), `MaxPool2d`,
+`AvgPool2d`, `BatchNorm1d/2d`, `LayerNorm`, `GroupNorm`, `Dropout`, `Flatten`,
+`ReLU/GELU/SiLU/Sigmoid/Tanh/Softplus/Softmax/LogSoftmax/LeakyReLU`, **recurrent**:
 `LSTM`, `GRU` (batch_first, return `(outputs, state)`), **attention**:
 `MultiHeadAttention`, `TransformerBlock` (pre-norm + residuals),
 `Transformer` (causal stacked blocks + final `LayerNorm`), `causal_mask(T)`.
+Class-based losses (`nn.MSELoss`, `nn.L1Loss`, `nn.HuberLoss`, `nn.BCELoss`,
+`nn.BCEWithLogitsLoss`, `nn.CrossEntropyLoss`, `nn.NLLLoss`) and `nn.init`
+(`kaiming_normal_/uniform_`, `xavier_normal_/uniform_`, `normal_/uniform_`, `zeros_/ones_`).
 
 ### optim & schedulers
-`SGD` (momentum/nesterov/weight-decay), `Adam`, `AdamW`, and
-`itorch.schedulers`: `StepLR`, `MultiStepLR`, `CosineAnnealingLR`, `ReduceLROnPlateau`.
-
-### losses, data, utils
-`mse`, `l1`, `huber`, `bce`, `cross_entropy`, `nll_loss`, `accuracy`,
-`clip_grad_norm_`, `TensorDataset`, `DataLoader` (shuffle/drop_last),
-`save`/`load` (npz), `count_parameters`.
+`SGD` (momentum/nesterov/weight-decay), `Adam`, `AdamW`, `Adagrad`, `RMSprop`,
+`Adamax`, `Lion`, and `itorch.schedulers`: `StepLR`, `MultiStepLR`,
+`CosineAnnealingLR`, `ReduceLROnPlateau`.
 
 ## run it
 
 ```bash
 python3 tests/test_autograd.py       # numeric-gradient check of every core op
 python3 tests/test_sophisticated.py  # gradchecks: gelu, norms, pools, rnns, attention, transformer, losses
+python3 tests/test_round3.py         # gradchecks: convT/col2im, new activations, optimizers, losses, VAE
 python3 tests/test_train.py          # end-to-end training smoke tests
 python3 examples/01_xor.py
 python3 examples/02_linear_regression.py
 python3 examples/03_mnist_cnn.py --epochs 3    # downloads MNIST (~11 MB), ~2 min
 python3 examples/04_tiny_gpt.py --steps 400    # char-level transformer, samples Shakespeare-ish text
+python3 examples/05_vae_mnist.py --epochs 2    # convolutional VAE, ~1.5 min, writes grid_vae.png
 ```
 
 ## how the autograd works
@@ -77,5 +78,7 @@ runs `∂z/∂add → ∂add/∂mul → ∂mul/∂x = 2`, leaving `x.grad == [2,
   scatter back with overlap-add.
 * **Verified end-to-end**: MNIST CNN **98.3% test accuracy in 3 epochs**; a
   ~40k-parameter char-level GPT drops cross-entropy from 2.4 to 0.13 and emits
-  coherent Shakespeare-style fragments.
-* **Small**: ~1,900 lines of Python, no compilation.
+  coherent Shakespeare-style fragments; a convolutional **VAE** (built on the
+  `col2im` op + reparameterization + free-bits KL) reconstructs digits and
+  generates a 10×10 grid of new ones.
+* **Small**: ~2,300 lines of Python, no compilation.

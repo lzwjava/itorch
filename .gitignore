@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 examples/mnist/
+examples/grid_*.png
 *.npz
 .DS_Store
