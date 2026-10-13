@@ -20,7 +20,18 @@ from .tensor import tensor, as_tensor, from_numpy, zeros, ones, full, arange, ra
 # --------------------------------------------------------------------------
 
 class no_grad:
-    """Disable gradient tracking inside a with-block."""
+    """Disable gradient tracking inside a with-block, or as a decorator.
+
+        with no_grad():
+            y = model(x)
+
+        @no_grad
+        def predict(x):
+            return model(x)
+    """
+
+    def __init__(self, fn=None):
+        self._fn = fn
 
     def __enter__(self):
         self._prev = _t._grad_enabled
@@ -30,6 +41,10 @@ class no_grad:
     def __exit__(self, *_exc):
         _t._grad_enabled = self._prev
         return False
+
+    def __call__(self, *args, **kwargs):
+        with self:
+            return self._fn(*args, **kwargs)
 
 
 def manual_seed(seed):
@@ -85,6 +100,7 @@ def exp(t):   return _as_tensor(t).exp()
 def log(t):   return _as_tensor(t).log()
 def sqrt(t):  return _as_tensor(t).sqrt()
 def relu(t):  return _as_tensor(t).relu()
+def gelu(t):  return _as_tensor(t).gelu()
 def sigmoid(t): return _as_tensor(t).sigmoid()
 def tanh(t):  return _as_tensor(t).tanh()
 def softmax(t, axis=-1):    return _as_tensor(t).softmax(axis=axis)
@@ -105,6 +121,19 @@ def mse(input, target):
     return (input - target).pow(2).mean()
 
 
+def l1(input, target):
+    """Mean absolute error."""
+    input, target = _as_tensor(input), _as_tensor(target)
+    return (input - target).abs().mean()
+
+
+def huber(input, target, delta=1.0):
+    """Smooth L1 / Huber loss."""
+    input, target = _as_tensor(input), _as_tensor(target)
+    err = (input - target).abs()
+    return where(err <= delta, 0.5 * (err * err), delta * (err - 0.5 * delta)).mean()
+
+
 def bce(input, target):
     """Binary cross entropy on raw logits."""
     input, target = _as_tensor(input), _as_tensor(target)
@@ -112,14 +141,18 @@ def bce(input, target):
     return -(target * s.log() + (1 - target) * (1 - s).log()).mean()
 
 
+def nll_loss(log_probs, targets):
+    """Negative log-likelihood on log-probabilities. log_probs: (N, C), targets: (N,) ints."""
+    log_probs = _as_tensor(log_probs)
+    if log_probs.ndim == 1:
+        log_probs = log_probs.unsqueeze(0)
+    targets = np.asarray(targets.data if isinstance(targets, Tensor) else targets, dtype=np.int64).reshape(-1, 1)
+    return -log_probs.gather(-1, targets).mean()
+
+
 def cross_entropy(logits, targets):
     """Cross entropy on raw logits. logits: (N, C), targets: (N,) ints."""
-    logits = _as_tensor(logits)
-    if logits.ndim == 1:
-        logits = logits.unsqueeze(0)
-    targets = np.asarray(targets.data if isinstance(targets, Tensor) else targets, dtype=np.int64).reshape(-1, 1)
-    ls = logits.log_softmax(axis=-1)
-    return -ls.gather(-1, targets).mean()
+    return nll_loss(_as_tensor(logits).log_softmax(axis=-1), targets)
 
 
 def accuracy(logits, targets):
@@ -168,13 +201,15 @@ class TensorDataset:
 
 
 class DataLoader:
-    def __init__(self, dataset, batch_size=32, shuffle=False):
+    def __init__(self, dataset, batch_size=32, shuffle=False, drop_last=False):
         self.dataset = dataset
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.drop_last = drop_last
 
     def __len__(self):
-        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+        n = len(self.dataset) // self.batch_size
+        return n if self.drop_last else (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
     def __iter__(self):
         idx = list(range(len(self.dataset)))
@@ -182,7 +217,8 @@ class DataLoader:
             np.random.shuffle(idx)
         dataset = self.dataset
         batch_size = self.batch_size
-        for i in range(0, len(idx), batch_size):
+        n_full = len(idx) - len(idx) % batch_size if self.drop_last else len(idx)
+        for i in range(0, n_full, batch_size):
             batch = idx[i:i + batch_size]
             items = [dataset[j] for j in batch]
             yield tuple(stack([it[k] for it in items], 0) for k in range(len(items[0])))
@@ -191,6 +227,14 @@ class DataLoader:
 # --------------------------------------------------------------------------
 # save / load
 # --------------------------------------------------------------------------
+
+def count_parameters(module):
+    """Total number of trainable parameters in a Module."""
+    n = 0
+    for p in module.parameters():
+        n += p.data.size
+    return n
+
 
 def save(model, path):
     """Save a Module's parameters (or a single Tensor) to a .npz file."""

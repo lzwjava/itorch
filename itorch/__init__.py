@@ -12,26 +12,25 @@ Requires only numpy. Fully usable for training small models on CPU:
 """
 from .tensor import Tensor, dtype
 from .tensor import (tensor, as_tensor, from_numpy, zeros, ones, full, arange, randn, rand)
-from . import tensor as _tensor_mod
-from . import functions, nn, optim
+from . import functions, nn, optim, schedulers
 from .functions import (no_grad, manual_seed,
                         cat, stack, where,
-                        exp, log, sqrt, relu, sigmoid, tanh, softmax, log_softmax,
+                        exp, log, sqrt, relu, gelu, sigmoid, tanh, softmax, log_softmax,
                         max, min, sum, mean,
-                        mse, bce, cross_entropy, accuracy,
-                        clip_grad_norm_,
+                        mse, l1, huber, bce, cross_entropy, nll_loss, accuracy,
+                        clip_grad_norm_, count_parameters,
                         TensorDataset, DataLoader,
                         save, load)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Tensor", "tensor", "as_tensor", "from_numpy", "zeros", "ones", "full", "arange", "randn", "rand",
-    "nn", "optim", "functions",
+    "nn", "optim", "functions", "schedulers",
     "no_grad", "manual_seed",
     "cat", "stack", "where",
-    "exp", "log", "sqrt", "relu", "sigmoid", "tanh", "softmax", "log_softmax",
+    "exp", "log", "sqrt", "relu", "gelu", "sigmoid", "tanh", "softmax", "log_softmax",
     "max", "min", "sum", "mean",
-    "mse", "bce", "cross_entropy", "accuracy",
-    "clip_grad_norm_", "TensorDataset", "DataLoader", "save", "load",
+    "mse", "l1", "huber", "bce", "cross_entropy", "nll_loss", "accuracy",
+    "clip_grad_norm_", "count_parameters", "TensorDataset", "DataLoader", "save", "load",
 ]

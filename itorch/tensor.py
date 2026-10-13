@@ -59,6 +59,25 @@ def _matmul_grads(a, b, g):
     return ga, gb
 
 
+def _erf(x):
+    """Vectorized erf via Abramowitz & Stegun 7.1.26 (~1.5e-7 max error).
+    Backward uses the derivative of THIS formula, so autograd stays exact."""
+    ax = np.abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * ax)
+    p = ((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592
+    y = 1.0 - p * t * np.exp(-ax * ax)
+    return np.where(x >= 0, y, -y)
+
+
+def _gelu(x):
+    return 0.5 * x * (1.0 + _erf(x / np.sqrt(2.0)))
+
+
+def _gelu_grad(x):
+    z = x / np.sqrt(2.0)
+    return 0.5 * (1.0 + _erf(z)) + x * np.exp(-z * z) / np.sqrt(2.0 * np.pi)
+
+
 def _as_tensor(data, requires_grad=False):
     if isinstance(data, Tensor):
         return data
@@ -83,12 +102,26 @@ class Tensor:
         self.grad = None                  # accumulated gradient (numpy array)
         self._parents = ()                # input Tensors of the op that made this
         self._backward = lambda grad: None
+        self._op = None                   # op name, for grad_fn debugging
 
     # -- bookkeeping -------------------------------------------------------
     def _set(self, parents, backward):
+        # name the op from the calling method (e.g. '__add__', 'matmul', 'relu')
+        try:
+            self._op = sys._getframe(1).f_code.co_name
+        except Exception:
+            self._op = "?"
         self._parents = tuple(parents)
         self._backward = backward
         return self
+
+    @property
+    def grad_fn(self):
+        """A human-readable description of the op that produced this tensor
+        (None for user-created leaves and for freed graphs)."""
+        if self._backward is None or self._op is None:
+            return None
+        return f"{self._op}({','.join(str(p.shape) for p in self._parents)}) -> {self.data.shape}"
 
     def _accumulate(self, g):
         if self.requires_grad and g is not None:
@@ -113,6 +146,10 @@ class Tensor:
     def to(self, *_a, **_k): return self
     def cpu(self):         return self
 
+    def __array__(self, dtype=None):
+        # let numpy treat a Tensor as a read-only view of its data (np.asarray(t), etc.)
+        return np.asarray(self.data, dtype=dtype)
+
     def detach(self):
         """Return a new Tensor sharing data but detached from the graph."""
         return Tensor(self.data)
@@ -122,8 +159,16 @@ class Tensor:
         return self
 
     # -- autograd -----------------------------------------------------------
-    def backward(self, grad=None):
-        """Compute gradients by reverse-mode autograd."""
+    def backward(self, grad=None, retain_graph=False):
+        """
+        Compute gradients by reverse-mode autograd.
+
+        The graph is freed after the pass unless `retain_graph=True` (call
+        backward() twice on the same graph only with retain_graph=True).
+        """
+        if self._backward is None:
+            raise RuntimeError("trying to backward() through a freed graph; "
+                               "use retain_graph=True to support repeated backward calls")
         if grad is None:
             grad = np.ones_like(self.data)
         grad = np.asarray(grad, dtype=dtype)
@@ -144,6 +189,12 @@ class Tensor:
         for t in reversed(topo):
             if t.requires_grad:
                 t._backward(t.grad)
+        if not retain_graph:
+            # free the graph (keep user-created leaf nodes usable for new graphs)
+            for t in topo:
+                if t._op is not None:
+                    t._backward = None
+                    t._parents = ()
         return self
 
     # -- arithmetic -----------------------------------------------------------
@@ -367,6 +418,15 @@ class Tensor:
             def backward(g):
                 g = np.asarray(g, dtype=dtype)
                 self._accumulate(g * np.where(self.data > 0, 1.0, alpha))
+            out._set((self,), backward)
+        return out
+
+    def gelu(self):
+        out = Tensor(_gelu(self.data), requires_grad=self.requires_grad and _grad_enabled)
+        if out.requires_grad:
+            def backward(g):
+                g = np.asarray(g, dtype=dtype)
+                self._accumulate(g * _gelu_grad(self.data))
             out._set((self,), backward)
         return out
 
